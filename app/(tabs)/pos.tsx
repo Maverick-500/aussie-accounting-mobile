@@ -13,10 +13,15 @@ import {
   Dimensions,
   KeyboardAvoidingView,
   Platform,
+  Alert,
 } from 'react-native'
-import { X, Plus, Minus, ShoppingCart, Check } from 'lucide-react-native'
+import { X, Plus, Minus, ShoppingCart, Check, WifiOff } from 'lucide-react-native'
 import { api } from '@/lib/api'
 import { formatAud } from '@/lib/format'
+import { getDb } from '@/lib/db'
+import { isOnline as checkOnline } from '@/lib/offline'
+import { getPendingOrderCount } from '@/lib/sync'
+import { useSyncStore } from '@/lib/sync-store'
 
 /* ------------------------------------------------------------------ */
 /* Types                                                               */
@@ -48,6 +53,18 @@ type CheckoutPhase = 'idle' | 'payment' | 'success'
 
 const GST_RATE = 10 // percent
 const ALL_CATEGORIES = 'All'
+
+/* ------------------------------------------------------------------ */
+/* UUID helper (no external dependency)                                */
+/* ------------------------------------------------------------------ */
+
+function uuid(): string {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0
+    const v = c === 'x' ? r : (r & 0x3) | 0x8
+    return v.toString(16)
+  })
+}
 
 /* ------------------------------------------------------------------ */
 /* GST helpers                                                         */
@@ -82,28 +99,78 @@ export default function POSScreen() {
   const [amountTendered, setAmountTendered] = useState('')
   const [orderNumber, setOrderNumber] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
+  const [savedOffline, setSavedOffline] = useState(false)
+
+  // Sync store (read-only here)
+  const { isOnline, pendingCount } = useSyncStore()
 
   // Responsive column count
   const screenWidth = Dimensions.get('window').width
   const numColumns = screenWidth > 768 ? 3 : 2
 
   /* ---------------------------------------------------------------- */
-  /* Fetch products                                                    */
+  /* Load products: SQLite first, then API refresh if online           */
   /* ---------------------------------------------------------------- */
 
-  const fetchProducts = useCallback(async () => {
+  const loadProductsFromSQLite = useCallback(async () => {
+    try {
+      const db = await getDb()
+      const rows = await db.getAllAsync<Product>(
+        'SELECT id, name, sale_price, category, gst_treatment FROM products ORDER BY name',
+      )
+      if (rows.length > 0) {
+        setProducts(rows)
+      }
+    } catch {
+      // SQLite read failure is non-fatal; we will fall through
+      // to the API fetch below.
+    }
+  }, [])
+
+  const fetchProductsFromApi = useCallback(async () => {
     try {
       setError(null)
       const result = await api<{ data: Product[] }>('/products')
       setProducts(result.data)
+
+      // Cache into SQLite for offline use
+      const db = await getDb()
+      for (const p of result.data) {
+        await db.runAsync(
+          `INSERT OR REPLACE INTO products
+             (id, name, sale_price, category, gst_treatment)
+           VALUES (?, ?, ?, ?, ?)`,
+          p.id,
+          p.name,
+          p.sale_price,
+          p.category ?? null,
+          p.gst_treatment ?? 'GST',
+        )
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load products')
+      // Only show API error if we have no cached products
+      if (products.length === 0) {
+        setError(err instanceof Error ? err.message : 'Failed to load products')
+      }
     }
-  }, [])
+  }, [products.length])
 
   useEffect(() => {
-    fetchProducts().finally(() => setLoading(false))
-  }, [fetchProducts])
+    async function bootstrap() {
+      // 1. Load cached products from SQLite (instant)
+      await loadProductsFromSQLite()
+
+      // 2. If online, refresh from the API
+      const online = await checkOnline()
+      if (online) {
+        await fetchProductsFromApi()
+      }
+
+      setLoading(false)
+    }
+    bootstrap()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   /* ---------------------------------------------------------------- */
   /* Derived: categories                                               */
@@ -198,43 +265,78 @@ export default function POSScreen() {
     setPaymentMethod('card')
     setAmountTendered('')
     setOrderNumber(null)
+    setSavedOffline(false)
   }
 
   /* ---------------------------------------------------------------- */
-  /* Submit order                                                      */
+  /* Submit order (online or offline)                                  */
   /* ---------------------------------------------------------------- */
 
   async function completeSale() {
     if (submitting) return
     setSubmitting(true)
-    try {
-      const items = cart.map((c) => ({
-        productId: c.productId,
-        name: c.name,
-        price: c.price,
-        qty: c.qty,
-      }))
-      const tendered =
-        paymentMethod === 'cash' ? parseFloat(amountTendered) || 0 : undefined
-      const result = await api<{ orderNumber: string }>('/orders', {
-        method: 'POST',
-        body: {
-          items,
-          subtotal: cartTotals.subtotal,
-          gstAmount: cartTotals.gstAmount,
-          total: cartTotals.total,
-          paymentMethod,
-          ...(paymentMethod === 'cash'
-            ? { amountTendered: tendered, changeGiven }
-            : {}),
-        },
-      })
-      setOrderNumber(result.orderNumber)
-      setCheckoutPhase('success')
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Order failed')
-    } finally {
-      setSubmitting(false)
+    setSavedOffline(false)
+
+    const items = cart.map((c) => ({
+      productId: c.productId,
+      name: c.name,
+      price: c.price,
+      qty: c.qty,
+    }))
+    const tendered =
+      paymentMethod === 'cash' ? parseFloat(amountTendered) || 0 : undefined
+
+    const orderPayload = {
+      items,
+      subtotal: cartTotals.subtotal,
+      gstAmount: cartTotals.gstAmount,
+      total: cartTotals.total,
+      paymentMethod,
+      ...(paymentMethod === 'cash'
+        ? { amountTendered: tendered, changeGiven }
+        : {}),
+    }
+
+    const online = await checkOnline()
+
+    if (online) {
+      // Attempt to POST directly to the API
+      try {
+        const result = await api<{ orderNumber: string }>('/orders', {
+          method: 'POST',
+          body: orderPayload,
+        })
+        setOrderNumber(result.orderNumber)
+        setCheckoutPhase('success')
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Order failed')
+      } finally {
+        setSubmitting(false)
+      }
+    } else {
+      // Save to SQLite for later sync
+      try {
+        const db = await getDb()
+        const id = uuid()
+        await db.runAsync(
+          'INSERT INTO pending_orders (id, payload, created_at, synced) VALUES (?, ?, ?, 0)',
+          id,
+          JSON.stringify(orderPayload),
+          new Date().toISOString(),
+        )
+
+        // Update pending count in the global store
+        const count = await getPendingOrderCount(db)
+        useSyncStore.getState().setPendingCount(count)
+
+        setOrderNumber(id.slice(0, 8).toUpperCase())
+        setSavedOffline(true)
+        setCheckoutPhase('success')
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Failed to save order locally')
+      } finally {
+        setSubmitting(false)
+      }
     }
   }
 
@@ -262,7 +364,7 @@ export default function POSScreen() {
             onPress={() => {
               setLoading(true)
               setError(null)
-              fetchProducts().finally(() => setLoading(false))
+              fetchProductsFromApi().finally(() => setLoading(false))
             }}
           >
             <Text style={styles.retryButtonText}>Retry</Text>
@@ -293,6 +395,23 @@ export default function POSScreen() {
         style={{ flex: 1 }}
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
       >
+        {/* ---- Offline indicator ---- */}
+        {!isOnline && (
+          <View style={styles.offlineBar}>
+            <WifiOff size={14} color="#ffffff" />
+            <Text style={styles.offlineText}>Offline</Text>
+          </View>
+        )}
+
+        {/* ---- Pending badge ---- */}
+        {isOnline && pendingCount > 0 && (
+          <View style={styles.pendingBar}>
+            <Text style={styles.pendingText}>
+              {pendingCount} order{pendingCount === 1 ? '' : 's'} pending sync
+            </Text>
+          </View>
+        )}
+
         {/* ---- Product grid section ---- */}
         <View style={styles.productsSection}>
           {/* Search bar */}
@@ -489,6 +608,11 @@ export default function POSScreen() {
                 <Text style={styles.successTotal}>
                   {formatAud(cartTotals.total)}
                 </Text>
+                {savedOffline && (
+                  <Text style={styles.offlineNote}>
+                    Saved offline. Will sync when connected.
+                  </Text>
+                )}
                 {paymentMethod === 'cash' && changeGiven > 0 && (
                   <Text style={styles.changeText}>
                     Change: {formatAud(changeGiven)}
@@ -574,6 +698,16 @@ export default function POSScreen() {
                   </View>
                 )}
 
+                {/* Offline notice in payment modal */}
+                {!isOnline && (
+                  <View style={styles.offlineNotice}>
+                    <WifiOff size={14} color="#92400e" />
+                    <Text style={styles.offlineNoticeText}>
+                      You are offline. The order will be saved locally.
+                    </Text>
+                  </View>
+                )}
+
                 {/* Error message */}
                 {error && <Text style={styles.inlineError}>{error}</Text>}
 
@@ -618,6 +752,32 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
     padding: 16,
+  },
+
+  /* Offline / pending bars */
+  offlineBar: {
+    backgroundColor: '#f97316',
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+  },
+  offlineText: {
+    color: '#ffffff',
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  pendingBar: {
+    backgroundColor: '#f59e0b',
+    paddingVertical: 4,
+    alignItems: 'center',
+  },
+  pendingText: {
+    color: '#ffffff',
+    fontSize: 12,
+    fontWeight: '600',
   },
 
   /* Error state */
@@ -990,6 +1150,22 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     color: '#16a34a',
   },
+  offlineNotice: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: '#fffbeb',
+    borderRadius: 8,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    marginBottom: 12,
+    width: '100%',
+  },
+  offlineNoticeText: {
+    fontSize: 13,
+    color: '#92400e',
+    flex: 1,
+  },
   inlineError: {
     fontSize: 14,
     color: '#dc2626',
@@ -1044,6 +1220,17 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     color: '#16a34a',
     marginBottom: 4,
+  },
+  offlineNote: {
+    fontSize: 14,
+    color: '#92400e',
+    backgroundColor: '#fffbeb',
+    borderRadius: 8,
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    marginBottom: 8,
+    textAlign: 'center',
+    overflow: 'hidden',
   },
   changeText: {
     fontSize: 16,
