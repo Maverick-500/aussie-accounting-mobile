@@ -31,6 +31,9 @@ export default function RootLayout() {
     <Stack screenOptions={{ headerShown: false }}>
       <Stack.Screen name="login" options={{ headerShown: false }} />
       <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
+      <Stack.Screen name="bank-transactions" options={{ headerShown: true, title: 'Bank Transactions' }} />
+      <Stack.Screen name="contacts" options={{ headerShown: true, title: 'Contacts' }} />
+      <Stack.Screen name="copilot" options={{ headerShown: true, title: 'AI Copilot' }} />
     </Stack>
   )
 }
